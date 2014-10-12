@@ -2,7 +2,8 @@ __author__ = 'pavel'
 
 from sh import tail
 from collections import deque
-import traceback, sys, re, time
+from time import gmtime, strftime
+import traceback, sys, re, time, sys
 from threading import Thread, Lock
 
 ###########################################################################
@@ -53,6 +54,9 @@ class AccessLogParser():
 
 ###########################################################################
 class AccessLogStats():
+    """
+    Class that implements statistics functionality
+    """
 
     def __init__(self, other = None):
         """
@@ -108,10 +112,13 @@ class AccessLogStats():
 
 ###########################################################################
 class AccessLogMonitor:
+    """
+    Class that implements monitor functionality.
+    """
 
     def __init__(self):
-        self._refresh_time = 10 #sec
-        self._alert_time = 120 #sec
+        self._refresh_time = 1 #sec
+        self._alert_time = 10 #sec
         self._alert_threshold = 10 #maximum number of hits per alert time
         self._alert_triggered = False #just flag
         self._access_log_path = '/var/log/apache2/access.log'
@@ -135,49 +142,81 @@ class AccessLogMonitor:
         :return:
         """
 
-        while True:
-            time.sleep(self._refresh_time)
+        try:
+            while True:
+                time.sleep(self._refresh_time)
+                timestamp = strftime("%Y-%m-%d %H:%M:%S", gmtime())
 
-            #Releasing lock first
-            self._draft_stats_lock.acquire()
-            draft_stats = AccessLogStats(self._draft_stats)
-            self._draft_stats.reset()
-            self._draft_stats_lock.release()
+                #Releasing lock first
+                self._draft_stats_lock.acquire()
+                draft_stats = AccessLogStats(self._draft_stats)
+                self._draft_stats.reset()
+                self._draft_stats_lock.release()
 
-            self._monitor_stats += draft_stats
-            self._alert_window_hits += (draft_stats.total_hits - self._alert_window.popleft())
-            self._alert_window.append(draft_stats.total_hits)
+                #Adding draft stats to monitor stats
+                self._monitor_stats += draft_stats
 
-            if (self._alert_windows_nums > 0):
+                #Updating total hits number in alert sliding window
+                self._alert_window_hits += (draft_stats.total_hits - self._alert_window.popleft())
+                #Updating alert sliding window
+                self._alert_window.append(draft_stats.total_hits)
 
-                alert_window_average_hits = self._alert_windows_hits_sum / self._alert_windows_nums
                 alert_message = None
-                if (self._alert_triggered):
-                    if (self._alert_window_hits <= alert_window_average_hits + self._alert_threshold):
-                        self._alert_triggered = False
-                else:
-                    if (self._alert_window_hits > alert_window_average_hits + self._alert_threshold):
-                        self._alert_triggered = True
 
-            self._alert_windows_hits_sum += self._alert_window_hits
-            self._alert_windows_nums += 1
+                if (self._alert_windows_nums % 10 == 0):
+                    alert_message = 'aaa'
 
-            print str(self._monitor_stats.get_monitor_data(most_popular_sections=True))
+                if (self._alert_windows_nums > 0):
+                    alert_window_average_hits = self._alert_windows_hits_sum / self._alert_windows_nums
 
+                    if (self._alert_triggered):
+                        #If alert was already triggered, check if traffic was back to normal
+                        if (self._alert_window_hits <= alert_window_average_hits + self._alert_threshold):
+                            self._alert_triggered = False
+                            alert_message = 'ALERT: Traffic back to normal. Hits {0} vs average {1}. Time: {2}'.format(self._alert_window_hits, alert_window_average_hits, timestamp)
+                    else:
+                        if (self._alert_window_hits > alert_window_average_hits + self._alert_threshold):
+                            self._alert_triggered = True
+                            alert_message = 'ALERT: Traffic is high! Hits {0} vs average {1}. Time: {2}'.format(self._alert_window_hits, alert_window_average_hits, timestamp)
+
+                #Updating alert windows statistics used for average calculation.
+                self._alert_windows_hits_sum += self._alert_window_hits
+                self._alert_windows_nums += 1
+
+                if (alert_message is not None):
+                    sys.stdout.write(alert_message + '\n')
+                    alert_message = None
+
+                sys.stdout.write('\r{0}: {1}'.format(timestamp, self._monitor_stats.get_monitor_data(most_popular_sections=True)))
+                sys.stdout.flush()
+
+
+
+        except (KeyboardInterrupt, SystemExit):
+            print 'Interrupted.'
 
     def run(self):
 
-        bg_thread = Thread(target=self._monitor_bg_process)
-        bg_thread.start()
+        try:
 
-        for line in tail('-f', '-n 0', self._access_log_path, _iter=True):
-            sample = self._parser.parse(line)
-            if (sample is not None):
-                self._draft_stats_lock.acquire()
-                self._draft_stats.add_sample(sample)
-                self._draft_stats_lock.release()
+            #Starting background thread which process and cleans draft statistics periodically
+            bg_thread = Thread(target=self._monitor_bg_process)
+            bg_thread.daemon = True
+            bg_thread.start()
 
-        bg_thread.join()
+            #Reading last line from tailing the log and appending it to draft statistics.
+            for line in tail('-f', '-n 0', self._access_log_path, _iter=True):
+                sample = self._parser.parse(line)
+                if (sample is not None):
+                    #Adding even if request was for non-existing resource. Easier to write test.
+                    self._draft_stats_lock.acquire()
+                    self._draft_stats.add_sample(sample)
+                    self._draft_stats_lock.release()
+
+            bg_thread.join()
+
+        except (KeyboardInterrupt, SystemExit):
+            print 'Interrupted.'
 
 
 ###########################################################################
